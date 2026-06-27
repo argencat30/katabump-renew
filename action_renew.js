@@ -257,43 +257,61 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
     return false;
 }
 
-// --- 业务状态判断：还没到可续期日期就停止重试 ---
-// 目的：把 KataBump 返回的“还没到续期时间”识别为 skipped，而不是当成临时失败反复刷新。
+
+// --- 新增：只做最小修复，不改原来的点击/验证流程 ---
+// 1) 全页面文本检测“还没到续期时间”，避免误判成模态框未关闭而重复 20 次。
+// 2) Renew 弹窗不再只依赖 #renew-modal，兼容 role=dialog / modal / 页面文案定位。
 async function detectNotYetRenewable(page) {
     const text = await page.evaluate(() => document.body.innerText || "").catch(() => "");
-    if (!text) return null;
 
-    const normalized = text.replace(/\s+/g, " ").trim();
-    const matched = normalized.match(/You can't renew your server yet[\s\S]{0,180}?(?:day\(s\)|days?|\.)/i);
-    if (matched) return matched[0].trim();
+    const matched = text.match(
+        /You can't renew your server yet[\s\S]{0,180}?day\(s\)\.?/i
+    );
 
-    if (/You can't renew your server yet/i.test(normalized) || /You will be able to as of/i.test(normalized)) {
-        const lines = text
+    if (matched) {
+        return matched[0].replace(/\s+/g, " ").trim();
+    }
+
+    if (
+        text.includes("You can't renew your server yet") ||
+        text.includes("You will be able to as of")
+    ) {
+        const line = text
             .split("\n")
             .map(s => s.trim())
-            .filter(Boolean);
-        const line = lines.find(s => /You can't renew your server yet/i.test(s) || /You will be able to as of/i.test(s));
+            .find(s =>
+                s.includes("You can't renew your server yet") ||
+                s.includes("You will be able to as of")
+            );
         return line || "You can't renew your server yet";
     }
 
     return null;
 }
 
-async function stopRetryIfNotYetRenewable(page, modal = null) {
-    const message = await detectNotYetRenewable(page);
-    if (!message) return false;
+async function ensureScreenshotsDir() {
+    const photoDir = path.join(process.cwd(), 'screenshots');
+    if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
+    return photoDir;
+}
 
-    console.log('   >> ⏳ 暂无法续期，停止重试。');
-    console.log('   >> 页面提示:', message);
+async function findRenewModal(page) {
+    const candidates = [
+        page.locator('#renew-modal'),
+        page.locator('[role="dialog"]').filter({ hasText: 'Renew' }).last(),
+        page.locator('.modal').filter({ hasText: 'Renew' }).last(),
+        page.locator('div').filter({ hasText: 'This will extend the life of your server.' }).last(),
+        page.locator('div').filter({ hasText: 'Captcha' }).filter({ hasText: 'Renew' }).last()
+    ];
 
-    if (modal) {
+    for (const modal of candidates) {
         try {
-            const closeBtn = modal.getByLabel('Close');
-            if (await closeBtn.isVisible({ timeout: 1000 })) await closeBtn.click();
+            await modal.waitFor({ state: 'visible', timeout: 1500 });
+            if (await modal.isVisible()) return modal;
         } catch (e) { }
     }
 
-    return true;
+    return null;
 }
 
 
@@ -410,11 +428,19 @@ async function stopRetryIfNotYetRenewable(page, modal = null) {
                     await renewBtn.click();
                     console.log('Renew 按钮已点击。等待模态框...');
 
-                    const modal = page.locator('#renew-modal');
-                    try { await modal.waitFor({ state: 'visible', timeout: 5000 }); } catch (e) {
+                    const modal = await findRenewModal(page);
+                    if (!modal) {
                         console.log('模态框未出现？重试中...');
+                        try {
+                            const photoDir = await ensureScreenshotsDir();
+                            await page.screenshot({
+                                path: path.join(photoDir, `renew_modal_not_found_${attempt}.png`),
+                                fullPage: true
+                            });
+                        } catch (e) { }
                         continue;
                     }
+                    console.log('Renew 模态框已识别。');
 
                     // 鼠标晃动模拟
                     try {
@@ -432,19 +458,23 @@ async function stopRetryIfNotYetRenewable(page, modal = null) {
                         // 截图 (Turnstile 状态)
                         // ...省略具体截图代码，保持原样逻辑即可...
 
-                        // 先读一次弹窗/页面文本：如果已经提示“还没到续期时间”，直接停止本轮，不再进入 20 次刷新重试。
-                        if (await stopRetryIfNotYetRenewable(page, modal)) {
-                            renewSuccess = true; // 这里表示本次任务已处理完，不代表实际续期成功
+                        const notReadyBefore = await detectNotYetRenewable(page);
+                        if (notReadyBefore) {
+                            console.log('   >> ⏳ 暂无法续期，停止重试。');
+                            console.log('   >> 页面提示:', notReadyBefore);
+                            renewSuccess = true;
                             break;
                         }
 
                         console.log('   >> 点击 Renew 确认按钮...');
                         await confirmBtn.click();
-                        await page.waitForTimeout(1500);
 
-                        // 点击确认后再读一次全页面文本：KataBump 经常在此时返回“还没到续期时间”。
-                        if (await stopRetryIfNotYetRenewable(page, modal)) {
-                            renewSuccess = true; // 这里表示本次任务已处理完，不代表实际续期成功
+                        await page.waitForTimeout(1500);
+                        const notReadyAfter = await detectNotYetRenewable(page);
+                        if (notReadyAfter) {
+                            console.log('   >> ⏳ 暂无法续期，停止重试。');
+                            console.log('   >> 页面提示:', notReadyAfter);
+                            renewSuccess = true;
                             break;
                         }
 
@@ -458,8 +488,15 @@ async function stopRetryIfNotYetRenewable(page, modal = null) {
                                     hasCaptchaError = true;
                                     break;
                                 }
-                                if (await stopRetryIfNotYetRenewable(page, modal)) {
-                                    renewSuccess = true; // 这里表示本次任务已处理完，不代表实际续期成功
+                                const notTimeLoc = page.getByText("You can't renew your server yet");
+                                if (await notTimeLoc.isVisible()) {
+                                    console.log(`   >> ⏳ 暂无法续期 (还没到时间)。`);
+                                    renewSuccess = true; // 视为完成
+                                    // ...截图与TG发送逻辑...
+                                    try { 
+                                        const closeBtn = modal.getByLabel('Close'); 
+                                        if (await closeBtn.isVisible()) await closeBtn.click(); 
+                                    } catch(e){}
                                     break;
                                 }
                                 await page.waitForTimeout(200);
