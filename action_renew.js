@@ -1922,16 +1922,16 @@ async function ensureScreenshotsDir() {
         }
 
         // 仅登录阶段 captcha_required 才触发代理轮换
+        // 不再根据字符串判断阶段，而是根据触发来源直接区分
+        if (runStatus === 'login_captcha_required') {
+            loginCaptchaFailed = true;
+        }
         if (runStatus === 'captcha_required') {
-            if (blockMessage && blockMessage.startsWith('Login')) {
-                loginCaptchaFailed = true;
-            } else {
-                // Renew ALTCHA 失败 → 覆盖 NOT_READY / ALREADY_RENEWED
-                if (overallExitCode === EXIT_CODE.SUCCESS ||
-                    overallExitCode === EXIT_CODE.NOT_READY ||
-                    overallExitCode === EXIT_CODE.ALREADY_RENEWED) {
-                    overallExitCode = EXIT_CODE.RENEW_CAPTCHA_FAILED;
-                }
+            // 不含 Login 前缀的 captcha_required → Renew 阶段触发，不换代理
+            if (overallExitCode === EXIT_CODE.SUCCESS ||
+                overallExitCode === EXIT_CODE.NOT_READY ||
+                overallExitCode === EXIT_CODE.ALREADY_RENEWED) {
+                overallExitCode = EXIT_CODE.RENEW_CAPTCHA_FAILED;
             }
         }
         if (runStatus === 'error') { overallExitCode = EXIT_CODE.FATAL; shouldStopAllUsers = true; }
