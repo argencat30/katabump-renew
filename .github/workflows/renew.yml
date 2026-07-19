@@ -5,6 +5,10 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
+concurrency:
+  group: katabump-renew
+  cancel-in-progress: true
+
 jobs:
   renew:
     runs-on: ubuntu-latest
@@ -43,6 +47,9 @@ jobs:
         else
           echo "WEBSHARE_PROXY_LIST_URL is empty, running without Webshare proxy."
         fi
+
+    - name: Syntax Check
+      run: npm run check
 
     - name: Run proxy runner (with up to 5 proxy switches)
       env:

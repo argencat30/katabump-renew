@@ -80,6 +80,18 @@ function removeExpiredCooldowns(cooldowns) {
 // ============================================================
 //  代理选择
 // ============================================================
+// 仅掩码 auth 部分，避免把整个代理 URL 当成单一掩码导致日志里仍出现明文
+function maskProxyUrl(proxyUrl) {
+    try {
+        const u = new URL(proxyUrl);
+        const auth = u.username || u.password
+            ? `${u.username || ''}:${u.password || ''}@`
+            : '';
+        return `${u.protocol}//${auth}***`;
+    } catch {
+        return proxyUrl.replace(/\/\/[^@]+@/, '//***@');
+    }
+}
 function loadProxies() {
     if (!fs.existsSync(CONFIG.PROXIES_FILE)) {
         console.log('[proxy-runner] proxies.txt 不存在，直接运行（无代理）');
@@ -87,8 +99,21 @@ function loadProxies() {
     }
     const raw = fs.readFileSync(CONFIG.PROXIES_FILE, 'utf-8');
     const lines = raw.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
-    console.log(`[proxy-runner] proxies.txt 共 ${lines.length} 条有效代理`);
-    return lines;
+    const valid = [];
+    const invalid = [];
+    for (const line of lines) {
+        const parsed = parseProxyLine(line);
+        if (parsed && parsed.ip && parsed.port) {
+            valid.push(line);
+        } else {
+            invalid.push(line);
+        }
+    }
+    if (invalid.length > 0) {
+        console.log(`[proxy-runner] 已过滤 ${invalid.length} 条无效代理格式: ${invalid.slice(0, 5).join(' | ')}${invalid.length > 5 ? ' ...' : ''}`);
+    }
+    console.log(`[proxy-runner] proxies.txt 共 ${valid.length} 条有效代理`);
+    return valid;
 }
 
 function selectRandomProxy(proxies, cooldowns) {
@@ -112,11 +137,46 @@ function selectRandomProxy(proxies, cooldowns) {
     return { line, source: 'selected' };
 }
 
+function parseProxyLine(line) {
+    const trimmed = (line || '').trim();
+    const authIdx = trimmed.lastIndexOf('@');
+    let hostPort = trimmed;
+    let userPass = '';
+
+    if (authIdx > 0) {
+        hostPort = trimmed.substring(authIdx + 1);
+        userPass = trimmed.substring(0, authIdx);
+    }
+
+    const parts = hostPort.split(':');
+    if (parts.length < 2) return null;
+
+    const ip = parts[0];
+    const port = parts[1];
+    let username = '';
+    let password = '';
+
+    if (userPass) {
+        const credParts = userPass.split(':');
+        username = credParts[0] || '';
+        password = credParts.slice(1).join(':') || '';
+    }
+
+    return { ip, port, username, password };
+}
+
 function buildHttpProxy(line) {
     if (!line) return null;
-    const parts = line.split(':');
-    if (parts.length < 4) return null;
-    return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+    const parsed = parseProxyLine(line);
+    if (!parsed || !parsed.ip || !parsed.port) return null;
+
+    const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
+    const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
+    const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
+
+    return auth
+        ? `http://${auth}@${parsed.ip}:${parsed.port}`
+        : `http://${parsed.ip}:${parsed.port}`;
 }
 
 // ============================================================
@@ -201,21 +261,17 @@ function runActionRenew(proxyLine) {
 
         if (proxyLine) {
             const proxyUrl = buildHttpProxy(proxyLine);
-            if (proxyUrl) {
-                env.HTTP_PROXY = proxyUrl;
-                env.HTTPS_PROXY = proxyUrl;
-                const ip = proxyLine.split(':')[0];
-                const port = proxyLine.split(':')[1];
-                console.log(`[proxy-runner] 设置 HTTP_PROXY=${ip}:${port}`);
-                // 屏蔽代理日志中的敏感信息
-                console.log(`::add-mask::${proxyUrl}`);
-                const parts = proxyLine.split(':');
-                console.log(`::add-mask::${parts[2]}`);
-                console.log(`::add-mask::${parts[3]}`);
-            } else {
-                delete env.HTTP_PROXY;
-                delete env.HTTPS_PROXY;
+            if (!proxyUrl) {
+                console.error(`[proxy-runner] 当前代理格式无效，不静默直连: ${proxyLine}`);
+                process.exit(EXIT_CODE.FATAL);
             }
+            env.HTTP_PROXY = proxyUrl;
+            env.HTTPS_PROXY = proxyUrl;
+            const ip = proxyLine.split(':')[0];
+            const port = proxyLine.split(':')[1];
+            console.log(`[proxy-runner] 设置 HTTP_PROXY=${ip}:${port}`);
+            console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
+            console.log(`::add-mask::${proxyUrl}`);
         } else {
             delete env.HTTP_PROXY;
             delete env.HTTPS_PROXY;
