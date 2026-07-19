@@ -47,7 +47,7 @@ function tests() {
         },
         {
             line: 'abc:def',
-            expect: { valid: false, reason: 'invalid_port:def' }
+            expect: { valid: false, reason: 'invalid_field_count:2' }
         },
         {
             line: '1.2.3.4:8080:user',
@@ -64,6 +64,22 @@ function tests() {
         {
             line: '# comment',
             expect: { valid: false, reason: 'empty_or_comment' }
+        },
+        {
+            line: '1.2.3.4:8080::password',
+            expect: { valid: false, reason: 'invalid_credentials' }
+        },
+        {
+            line: '1.2.3.4:8080:username:',
+            expect: { valid: false, reason: 'invalid_credentials' }
+        },
+        {
+            line: 'user:pa:ss@1.2.3.4:8080',
+            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa:ss', valid: true }
+        },
+        {
+            line: 'user:pass@1.2.3.4:8080:garbage',
+            expect: { valid: false, reason: 'invalid_host_field_count:3' }
         }
     ];
 
@@ -137,6 +153,47 @@ function tests() {
             fs.existsSync = origExistsSync;
             fs.readFileSync = origReadFileSync;
         }
+    }
+
+    // loadProxies: preserves original line numbers (skipping blank/comment lines)
+    {
+        const origExistsSync = fs.existsSync;
+        const origReadFileSync = fs.readFileSync;
+        fs.existsSync = () => true;
+        fs.readFileSync = () => '# header\n\n1.2.3.4:99999:u:p\n5.6.7.8:8080:u2:p2\n';
+        try {
+            const withHeader = mod.loadProxies();
+            assert.strictEqual(withHeader.configured, true);
+            assert.strictEqual(withHeader.valid.length, 1);
+            assert.strictEqual(withHeader.invalidCount, 1);
+            // The valid line is on original line 4 (after 2 header/blank lines)
+            assert.strictEqual(withHeader.valid[0].lineNumber, 4);
+        } finally {
+            fs.existsSync = origExistsSync;
+            fs.readFileSync = origReadFileSync;
+        }
+    }
+
+    // buildChildEnv: null parsed clears all proxy env vars
+    {
+        const base = { ...process.env };
+        base.HTTP_PROXY = 'http://old:proxy';
+        base.HTTPS_PROXY = 'http://old:proxy';
+        base.http_proxy = 'http://old:proxy';
+        base.https_proxy = 'http://old:proxy';
+        const cleaned = mod.buildChildEnv(null, base);
+        assert.strictEqual(cleaned.HTTP_PROXY, undefined);
+        assert.strictEqual(cleaned.HTTPS_PROXY, undefined);
+        assert.strictEqual(cleaned.http_proxy, undefined);
+        assert.strictEqual(cleaned.https_proxy, undefined);
+    }
+
+    // buildChildEnv: valid parsed sets proxy env vars
+    {
+        const base = { ...process.env };
+        const cleaned = mod.buildChildEnv(mod.parseProxyLine('1.2.3.4:8080:user:pass'), base);
+        assert.ok(cleaned.HTTP_PROXY.includes('1.2.3.4:8080'));
+        assert.ok(cleaned.HTTPS_PROXY.includes('1.2.3.4:8080'));
     }
 
     console.log('[proxy-runner tests] all tests passed');

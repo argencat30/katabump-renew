@@ -84,34 +84,16 @@ function parseProxyLine(line, lineNumber) {
     const trimmed = (line || '').trim();
     if (!trimmed || trimmed.startsWith('#')) return { valid: false, reason: 'empty_or_comment', lineNumber };
 
-    // Try USER:PASS@HOST:PORT format first (only when @ separates exactly 2 cred fields from 1 host field)
     const atIdx = trimmed.lastIndexOf('@');
-    if (atIdx > 0) {
-        const before = trimmed.substring(0, atIdx);
-        const after = trimmed.substring(atIdx + 1);
-        const beforeColons = before.split(':');
-        const afterColons = after.split(':');
-        if (beforeColons.length === 2 && afterColons.length >= 2) {
-            const host = afterColons[0];
-            const port = afterColons[1];
-            if (host && port) {
-                const portNum = Number(port);
-                if (Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535) {
-                    return { valid: true, ip: host, port, username: beforeColons[0], password: beforeColons[1], lineNumber };
-                }
-                return { valid: false, reason: `invalid_port:${port}`, lineNumber };
-            }
-            if (!host) return { valid: false, reason: 'empty_host', lineNumber };
-            return { valid: false, reason: 'empty_port', lineNumber };
-        }
-        // @ present but not matching USER:PASS@HOST:PORT — fall through to colon-count format below
-    }
 
-    // HOST:PORT or HOST:PORT:USER:PASS — determined purely by field count
-    const parts = trimmed.split(':');
-    if (parts.length === 2) {
-        const ip = parts[0];
-        const port = parts[1];
+    // Prefer colon-count format only when the second field is a valid port number.
+    // This avoids mistaking USER:PASS@HOST:PORT (with @ in password) for HOST:PORT:USER:PASS.
+    const colonParts = trimmed.split(':');
+    const secondIsInteger = Number.isInteger(Number(colonParts[1]));
+
+    if (colonParts.length === 2 && secondIsInteger) {
+        const ip = colonParts[0];
+        const port = colonParts[1];
         if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
         if (!port) return { valid: false, reason: 'empty_port', lineNumber };
         const portNum = Number(port);
@@ -121,20 +103,57 @@ function parseProxyLine(line, lineNumber) {
         return { valid: true, ip, port, username: '', password: '', lineNumber };
     }
 
-    if (parts.length >= 4) {
-        const ip = parts[0];
-        const port = parts[1];
+    if (colonParts.length >= 4 && secondIsInteger) {
+        const ip = colonParts[0];
+        const port = colonParts[1];
         if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
         if (!port) return { valid: false, reason: 'empty_port', lineNumber };
         const portNum = Number(port);
         if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
             return { valid: false, reason: `invalid_port:${port}`, lineNumber };
         }
-        return { valid: true, ip, port, username: parts[2] || '', password: parts.slice(3).join(':'), lineNumber };
+        const username = colonParts[2] || '';
+        const password = colonParts.slice(3).join(':') || '';
+        const hasUser = username.length > 0;
+        const hasPass = password.length > 0;
+        if (hasUser !== hasPass) {
+            return { valid: false, reason: 'invalid_credentials', lineNumber };
+        }
+        return { valid: true, ip, port, username, password, lineNumber };
     }
 
-    // 3 fields or any other count → ambiguous / malformed
-    return { valid: false, reason: `invalid_field_count:${parts.length}`, lineNumber };
+    // Fallback: USER:PASS@HOST:PORT
+    if (atIdx > 0) {
+        const before = trimmed.substring(0, atIdx);
+        const after = trimmed.substring(atIdx + 1);
+        const firstColon = before.indexOf(':');
+        if (firstColon > 0) {
+            const username = before.substring(0, firstColon);
+            const password = before.substring(firstColon + 1);
+            const afterColons = after.split(':');
+            if (afterColons.length === 2) {
+                const host = afterColons[0];
+                const port = afterColons[1];
+                if (host && port) {
+                    const portNum = Number(port);
+                    if (Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535) {
+                        const hasUser = username.length > 0;
+                        const hasPass = password.length > 0;
+                        if (hasUser !== hasPass) {
+                            return { valid: false, reason: 'invalid_credentials', lineNumber };
+                        }
+                        return { valid: true, ip: host, port, username, password, lineNumber };
+                    }
+                    return { valid: false, reason: `invalid_port:${port}`, lineNumber };
+                }
+                if (!host) return { valid: false, reason: 'empty_host', lineNumber };
+                return { valid: false, reason: 'empty_port', lineNumber };
+            }
+            return { valid: false, reason: `invalid_host_field_count:${afterColons.length}`, lineNumber };
+        }
+    }
+
+    return { valid: false, reason: `invalid_field_count:${colonParts.length}`, lineNumber };
 }
 
 function buildHttpProxy(parsed) {
@@ -149,6 +168,24 @@ function buildHttpProxy(parsed) {
 
 function proxyKey(parsed) {
     return `${parsed.ip}:${parsed.port}`;
+}
+
+function buildChildEnv(parsed, baseEnv) {
+    const env = { ...(baseEnv || process.env) };
+    if (parsed === null) {
+        delete env.HTTP_PROXY;
+        delete env.HTTPS_PROXY;
+        delete env.http_proxy;
+        delete env.https_proxy;
+        return env;
+    }
+    const proxyUrl = buildHttpProxy(parsed);
+    if (!proxyUrl) {
+        return null;
+    }
+    env.HTTP_PROXY = proxyUrl;
+    env.HTTPS_PROXY = proxyUrl;
+    return env;
 }
 
 function maskProxyUrl(proxyUrl) {
@@ -177,11 +214,18 @@ function loadProxies() {
         return { configured: false, valid: [], invalidCount: 0 };
     }
     const raw = fs.readFileSync(CONFIG.PROXIES_FILE, 'utf-8');
-    const lines = raw.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+    const lines = raw.split('\n');
+    const nonEmptyLines = [];
+    for (let origIdx = 0; origIdx < lines.length; origIdx++) {
+        const trimmed = lines[origIdx].trim();
+        if (trimmed && !trimmed.startsWith('#')) {
+            nonEmptyLines.push({ trimmed, lineNumber: origIdx + 1 });
+        }
+    }
     const valid = [];
     const invalid = [];
-    for (let i = 0; i < lines.length; i++) {
-        const parsed = parseProxyLine(lines[i], i + 1);
+    for (const { trimmed, lineNumber } of nonEmptyLines) {
+        const parsed = parseProxyLine(trimmed, lineNumber);
         if (parsed.valid) {
             valid.push(parsed);
         } else {
@@ -293,24 +337,17 @@ function ensureChromeKilled() {
 // ============================================================
 function runActionRenew(parsed) {
     return new Promise((resolve) => {
-        const env = { ...process.env };
+        const env = buildChildEnv(parsed, process.env);
+        if (!env) {
+            console.error('[proxy-runner] 当前代理格式无效，不静默直连');
+            process.exit(EXIT_CODE.FATAL);
+        }
 
         if (parsed === null) {
-            // 无代理直连模式：显式清除代理环境变量
-            delete env.HTTP_PROXY;
-            delete env.HTTPS_PROXY;
-            delete env.http_proxy;
-            delete env.https_proxy;
             console.log('[proxy-runner] 无代理模式，已清除 HTTP_PROXY / HTTPS_PROXY');
         } else {
-            const proxyUrl = buildHttpProxy(parsed);
-            if (!proxyUrl) {
-                console.error(`[proxy-runner] 当前代理格式无效，不静默直连`);
-                process.exit(EXIT_CODE.FATAL);
-            }
-            env.HTTP_PROXY = proxyUrl;
-            env.HTTPS_PROXY = proxyUrl;
             console.log(`[proxy-runner] 设置 HTTP_PROXY=${safeProxyId(parsed)}`);
+            const proxyUrl = buildHttpProxy(parsed);
             console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
             console.log(`::add-mask::${proxyUrl}`);
         }
@@ -436,6 +473,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename
 module.exports = {
     parseProxyLine,
     buildHttpProxy,
+    buildChildEnv,
     maskProxyUrl,
     loadProxies,
     selectRandomProxy,
