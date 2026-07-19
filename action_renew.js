@@ -319,8 +319,19 @@ async function waitAfterTurnstileClick(page, urlBefore, initialTimeoutMs = 15000
     // 记录网络错误和 frame 生命周期
     let pageErrors = [];
     let consoleErrors = [];
-    const errorHandler = (msg) => { if (msg.type() === 'error' || msg.type() === 'warning') consoleErrors.push(msg.text()); };
-    const pageErrorHandler = (err) => { pageErrors.push(err.message); };
+    let turnstileErrorCode = null;
+    const errorHandler = (msg) => {
+        if (msg.type() === 'error' || msg.type() === 'warning') {
+            consoleErrors.push(msg.text());
+            const m = msg.text().match(/\b(600\d{3})\b/);
+            if (m) turnstileErrorCode = Number(m[1]);
+        }
+    };
+    const pageErrorHandler = (err) => {
+        pageErrors.push(err.message);
+        const m = err.message.match(/\b(600\d{3})\b/);
+        if (m) turnstileErrorCode = Number(m[1]);
+    };
     try {
         page.on('pageerror', pageErrorHandler);
         page.on('console', errorHandler);
@@ -415,6 +426,11 @@ async function waitAfterTurnstileClick(page, urlBefore, initialTimeoutMs = 15000
 
             if (curUrl) lastFrameUrl = curUrl;
 
+            if (turnstileErrorCode && String(turnstileErrorCode).startsWith('600')) {
+                console.log(`[登录阶段] 检测到 Turnstile 错误码 ${turnstileErrorCode}，立即结束等待`);
+                break;
+            }
+
             await page.waitForTimeout(500);
         }
     } finally {
@@ -433,6 +449,12 @@ async function waitAfterTurnstileClick(page, urlBefore, initialTimeoutMs = 15000
     if (finalInfo.verificationFailed) {
         console.log('[登录阶段] state=turnstile_verification_failed');
         return { state: 'turnstile_verification_failed', length: 0, sawProgress };
+    }
+    if (turnstileErrorCode && String(turnstileErrorCode).startsWith('600')) {
+        console.log(`[Turnstile FatalError] Error: ${turnstileErrorCode}.`);
+        if (pageErrors.length) console.log(`[Turnstile PageError] ${pageErrors.slice(0, 3).join(' | ')}`);
+        if (consoleErrors.length) console.log(`[Turnstile Console] ${consoleErrors.slice(0, 3).join(' | ')}`);
+        return { state: 'turnstile_adapter_error', length: 0, sawProgress, errorCode: turnstileErrorCode };
     }
     if (pageErrors.length > 0) {
         console.log(`[Turnstile PageError] ${pageErrors.slice(0, 3).join(' | ')}`);
@@ -851,8 +873,16 @@ async function solveLoginTurnstile(page, totalTimeoutMs = 180000) {
             continue;
         }
 
-        // click_no_effect 或 challenge_progress_no_token
+        // click_no_effect 或 challenge_progress_no_token 或 turnstile_adapter_error
         lastState = after.state;
+        if (after.state === 'turnstile_adapter_error') {
+            if (attempt >= maxAttempts) {
+                return { ok: false, state: 'turnstile_adapter_error', message: `Turnstile adapter error ${after.errorCode}` };
+            }
+            console.log(`[登录阶段] Turnstile 适配器错误 (${after.errorCode}) → 刷新进入下一完整尝试`);
+            try { await reloadLoginChallenge(page, 'adapter_error'); } catch (e) {}
+            continue;
+        }
         if (attempt >= maxAttempts) {
             return { ok: false, state: lastState, message: `after.click sent, state=${after.state}, sawProgress=${after.sawProgress}` };
         }
@@ -1286,7 +1316,9 @@ async function runMain() {
                         ? `login_turnstile_widget_not_ready_${accountLabel}`
                         : state === 'turnstile_click_target_missing'
                             ? `login_turnstile_click_target_missing_${accountLabel}`
-                            : `login_turnstile_token_missing_${accountLabel}`;
+                            : state === 'turnstile_adapter_error'
+                                ? `login_turnstile_adapter_error_${accountLabel}`
+                                : `login_turnstile_token_missing_${accountLabel}`;
                 await dumpDebugSnapshot(page, snapName);
                 shouldStopAllUsers = true;
                 // break removed - let unified finalize handle

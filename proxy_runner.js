@@ -350,7 +350,6 @@ function runActionRenew(parsed) {
         logger: console.error
     }).then((result) => {
         if (result.error) console.error('[proxy-runner] 启动或运行子进程失败:', result.error.message);
-        console.log(`[proxy-runner] action_renew.js 退出码: ${result.code}`);
         return { code: result.code, timedOut: result.timedOut };
     });
 }
@@ -405,8 +404,6 @@ async function main() {
         if (code === EXIT_CODE.PROXY_RETRY && selection) {
             const parsed = selection;
             const key = proxyKey(parsed);
-            console.log(`[proxy-runner] action_renew.js 退出码: 42`);
-            console.log(`[proxy-runner] 代理 ${safeProxyId(parsed)} 加入冷却，时长 4h`);
             addCooldown(cooldowns, key, 'proxy_retry_from_action_renew');
             cooldowns = loadCooldowns();
             console.log(`[proxy-runner] 选择下一个代理`);
